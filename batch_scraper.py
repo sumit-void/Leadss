@@ -362,7 +362,7 @@ def main():
     parser.add_argument("--file", default="queries.txt", help="Path to queries file")
     parser.add_argument("--max", type=int, default=100, help="Max results per query (default: 100)")
     parser.add_argument("--concurrency", type=int, default=5, help="Concurrent pages to process (default: 5)")
-    parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
+    parser.add_argument("--headed", action="store_false", dest="headless", help="Run browser with GUI (headed mode)")
     args = parser.parse_args()
 
     queries_file = args.file

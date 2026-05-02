@@ -69,7 +69,7 @@ if not check_password():
 def generate_pitch_with_opus(lead_data, offering_context, region):
     try:
         bedrock = boto3.client(service_name='bedrock-runtime', region_name=region)
-        model_id = 'anthropic.claude-3-opus-20240229-v1:0'
+        model_id = 'anthropic.claude-opus-4-7'
         
         prompt = f"""You are an elite, top-performing B2B sales development representative. 
 Your task is to write a highly personalized, compelling, and concise cold outreach pitch for the following lead.
@@ -104,7 +104,7 @@ Instructions:
         response_body = json.loads(response.get('body').read())
         return response_body['content'][0]['text']
     except Exception as e:
-        return f"Error invoking AWS Bedrock (Opus 3): {e}"
+        return f"Error invoking AWS Bedrock (Opus 4.7): {e}"
 
 
 # --- APP CORE ---
@@ -157,7 +157,7 @@ def main():
         df = dfs[sheet_name]
         
         # Dashboard Layout Tabs
-        tab_overview, tab_data, tab_ai_pitch = st.tabs(["📈 Overview", "🗃️ Data Explorer", "🤖 AI Pitch Generator (Opus)"])
+        tab_overview, tab_data, tab_ai_pitch = st.tabs(["📈 Overview", "🗃️ Data Explorer", "🤖 AI Pitch Generator (Opus 4.7)"])
         
         with tab_overview:
             st.header("Campaign Overview")
@@ -197,7 +197,7 @@ def main():
             
         with tab_ai_pitch:
             st.header("AI Pitch Generator")
-            st.markdown("Powered by **AWS Bedrock (Claude 3 Opus)**")
+            st.markdown("Powered by **AWS Bedrock (Claude Opus 4.7)**")
             
             col_a, col_b = st.columns([1, 2])
             
@@ -220,8 +220,8 @@ def main():
                 
             with col_b:
                 st.subheader("3. Generate Pitch")
-                if st.button("🚀 Generate Pitch with Claude 3 Opus", type="primary", use_container_width=True):
-                    with st.spinner("Claude 3 Opus is crafting the perfect pitch..."):
+                if st.button("🚀 Generate Pitch with Claude Opus 4.7", type="primary", use_container_width=True):
+                    with st.spinner("Claude Opus 4.7 is crafting the perfect pitch..."):
                         # Get the specific lead data
                         if 'Name' in df.columns:
                             lead_row = df[df['Name'] == selected_lead_name].iloc[0].to_dict()

@@ -69,7 +69,14 @@ if not check_password():
 def generate_pitch_with_opus(lead_data, offering_context, region):
     try:
         bedrock = boto3.client(service_name='bedrock-runtime', region_name=region)
-        model_id = 'anthropic.claude-opus-4-7'
+        
+        # Use cross-region inference profiles for Opus 4.7
+        if region.startswith('us-'):
+            model_id = 'us.anthropic.claude-opus-4-7'
+        elif region.startswith('eu-'):
+            model_id = 'eu.anthropic.claude-opus-4-7'
+        else:
+            model_id = 'apac.anthropic.claude-opus-4-7'
         
         prompt = f"""You are an elite, top-performing B2B sales development representative. 
 Your task is to write a highly personalized, compelling, and concise cold outreach pitch for the following lead.

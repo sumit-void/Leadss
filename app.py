@@ -1,19 +1,18 @@
 import streamlit as st
 import pandas as pd
 import os
-import json
-import boto3
-from glob import glob
+import io
+import sqlite3
 
 # --- CONFIGURATION ---
 st.set_page_config(
-    page_title="LeadMiner AI Dashboard Pro",
-    page_icon="💎",
+    page_title="LeadMiner Pro - CRM Dashboard",
+    page_icon="🗃️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for a more advanced look
+# Custom CSS for an advanced, modern look
 st.markdown("""
 <style>
     .reportview-container .main .block-container{
@@ -25,15 +24,23 @@ st.markdown("""
         border-radius: 10px;
         box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
         text-align: center;
+        border-left: 4px solid #4facfe;
     }
     .metric-value {
-        font-size: 2rem;
+        font-size: 2.2rem;
         font-weight: bold;
         color: #4facfe;
     }
     .metric-label {
         font-size: 1rem;
         color: #a0a0b0;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+    }
+    /* Style the dataframe to look better */
+    .stDataFrame {
+        border-radius: 10px;
+        overflow: hidden;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -65,180 +72,255 @@ if not check_password():
     st.stop()
 
 
-# --- BEDROCK INTEGRATION ---
-def generate_pitch_with_opus(lead_data, offering_context, region):
-    try:
-        bedrock = boto3.client(service_name='bedrock-runtime', region_name=region)
-        
-        # Use standard model ID for Opus 4 (or cross-region if needed, but standard is often supported directly)
-        model_id = 'anthropic.claude-opus-4-20250514-v1:0'
-        
-        prompt = f"""You are an elite, top-performing B2B sales development representative. 
-Your task is to write a highly personalized, compelling, and concise cold outreach pitch for the following lead.
+# --- DATABASE INTEGRATION ---
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leadminer.db")
 
-Target Lead Information:
-{json.dumps(lead_data, indent=2)}
+def load_data_from_db():
+    if not os.path.exists(DB_PATH):
+        return pd.DataFrame()
+    conn = sqlite3.connect(DB_PATH)
+    query = "SELECT * FROM leads ORDER BY created_at DESC"
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
 
-Our Product/Service Offering:
-{offering_context}
+def update_status_in_db(lead_id, new_status):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE leads SET status = ? WHERE id = ?', (new_status, lead_id))
+    conn.commit()
+    conn.close()
 
-Instructions:
-1. Write a catchy and relevant subject line.
-2. Personalize the opening based on their business name or location.
-3. Clearly state the value proposition based on our offering.
-4. Keep the email concise (under 150 words) and professional.
-5. End with a soft, clear call-to-action (CTA).
-6. Do NOT include placeholder tags like [Your Name], just provide the template text body."""
+def convert_df_to_excel(df):
+    """Convert pandas dataframe to an in-memory Excel file for downloading."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Filtered_Leads')
+    return output.getvalue()
 
-        body = json.dumps({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 1500,
-            "temperature": 0.7,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        })
-        
-        response = bedrock.invoke_model(body=body, modelId=model_id)
-        response_body = json.loads(response.get('body').read())
-        return response_body['content'][0]['text']
-    except Exception as e:
-        return f"Error invoking AWS Bedrock (Opus 4): {e}"
-
-
-# --- APP CORE ---
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
-
-@st.cache_data
-def load_data(file_path):
-    try:
-        xls = pd.ExcelFile(file_path)
-        return {sheet: xls.parse(sheet) for sheet in xls.sheet_names}
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
-        return None
 
 def main():
     # Sidebar Navigation & Settings
-    st.sidebar.title("💎 LeadMiner Pro")
-    st.sidebar.markdown("Advanced AI-Powered Lead Intelligence")
+    st.sidebar.title("🗃️ LeadMiner Data Hub")
+    st.sidebar.markdown("Advanced Lead CRM System")
+    st.sidebar.divider()
     
-    st.sidebar.subheader("AWS Bedrock Settings")
-    aws_region = st.sidebar.selectbox("AWS Region", ["us-east-1", "us-west-2", "eu-central-1", "ap-southeast-2"], index=1)
+    # Load entire master database
+    df = load_data_from_db()
     
-    # Check output directory
-    if not os.path.exists(OUTPUT_DIR):
-        st.warning(f"Output directory not found at {OUTPUT_DIR}. Please run the scraper first.")
+    if df.empty:
+        st.warning(f"Database is empty or missing. Please run the scraper first.")
         return
 
-    excel_files = glob(os.path.join(OUTPUT_DIR, "*.xlsx"))
-    excel_files.sort(key=os.path.getmtime, reverse=True)
-
-    if not excel_files:
-        st.info("No scraped results found. Run the scraper to generate some leads!")
-        return
-
-    st.sidebar.subheader("📁 Select Dataset")
-    file_names = [os.path.basename(f) for f in excel_files]
-    selected_file_name = st.sidebar.selectbox("Choose a batch file:", file_names)
+    # Filter by specific queries or Global Merged Output
+    queries = ["Global Merged Master List"] + sorted(df['query'].dropna().unique().tolist())
+    selected_query = st.sidebar.selectbox("📁 Select Batch View:", queries)
     
+    if selected_query != "Global Merged Master List":
+        df = df[df['query'] == selected_query]
+
     # Main content area
-    st.title("LeadMiner Pro: Intelligence Dashboard")
+    st.title("Data Intelligence CRM")
+    st.markdown("Filter, edit, map, and export your high-quality leads.")
     
-    if selected_file_name:
-        selected_file_path = os.path.join(OUTPUT_DIR, selected_file_name)
-        dfs = load_data(selected_file_path)
+    # Dashboard Layout Tabs
+    tab_overview, tab_explorer, tab_map, tab_analytics = st.tabs([
+        "📈 Campaign Overview", 
+        "🔍 Advanced Data CRM", 
+        "🌍 Geospatial Map", 
+        "📊 Analytics"
+    ])
+    
+    with tab_overview:
+        st.header("Dataset Summary")
         
-        if not dfs:
-            return
+        # Calculate raw metrics
+        total_leads = len(df)
+        emails_count = len(df[df['email'].notna() & (df['email'] != "")])
+        phones_count = len(df[df['phone'].notna() & (df['phone'] != "")])
+        websites_count = len(df[df['website'].notna() & (df['website'] != "")])
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.markdown(f'<div class="metric-card"><div class="metric-value">{total_leads}</div><div class="metric-label">Total Leads</div></div>', unsafe_allow_html=True)
+        with col2:
+            st.markdown(f'<div class="metric-card"><div class="metric-value">{emails_count}</div><div class="metric-label">Emails Found</div></div>', unsafe_allow_html=True)
+        with col3:
+            st.markdown(f'<div class="metric-card"><div class="metric-value">{phones_count}</div><div class="metric-label">Phones Found</div></div>', unsafe_allow_html=True)
+        with col4:
+            st.markdown(f'<div class="metric-card"><div class="metric-value">{websites_count}</div><div class="metric-label">Websites Found</div></div>', unsafe_allow_html=True)
             
-        sheet_name = st.sidebar.selectbox("Select Sheet:", list(dfs.keys()))
-        df = dfs[sheet_name]
+        st.markdown("<br><br>", unsafe_allow_html=True)
         
-        # Dashboard Layout Tabs
-        tab_overview, tab_data, tab_ai_pitch = st.tabs(["📈 Overview", "🗃️ Data Explorer", "🤖 AI Pitch Generator (Opus 4)"])
-        
-        with tab_overview:
-            st.header("Campaign Overview")
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.markdown(f'<div class="metric-card"><div class="metric-value">{len(df)}</div><div class="metric-label">Total Leads Extracted</div></div>', unsafe_allow_html=True)
-            with col2:
-                # Estimate emails found if column exists
-                emails_count = len(df[df['Email'].notna()]) if 'Email' in df.columns else "N/A"
-                st.markdown(f'<div class="metric-card"><div class="metric-value">{emails_count}</div><div class="metric-label">Emails Found</div></div>', unsafe_allow_html=True)
-            with col3:
-                phones_count = len(df[df['Phone'].notna()]) if 'Phone' in df.columns else "N/A"
-                st.markdown(f'<div class="metric-card"><div class="metric-value">{phones_count}</div><div class="metric-label">Phone Numbers Found</div></div>', unsafe_allow_html=True)
-                
-            st.markdown("<br>", unsafe_allow_html=True)
-            with open(selected_file_path, "rb") as file:
-                st.download_button(
-                    label="📥 Download Full Dataset (Excel)",
-                    data=file,
-                    file_name=selected_file_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+        # Direct Download of the entire original file
+        st.subheader("📥 Direct Download")
+        st.markdown("Download the raw, unfiltered Excel file for this view.")
+        excel_data_all = convert_df_to_excel(df)
+        st.download_button(
+            label="📥 Download View as Excel",
+            data=excel_data_all,
+            file_name=f"leadminer_{selected_query.replace(' ', '_')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
-        with tab_data:
-            st.header("Data Explorer")
-            # Quick search filter
-            search_query = st.text_input("🔍 Quick Search (Name, Category, etc.)")
-            filtered_df = df
-            if search_query:
-                # Basic string contains filter across all string columns
-                mask = filtered_df.astype(str).apply(lambda x: x.str.contains(search_query, case=False)).any(axis=1)
-                filtered_df = filtered_df[mask]
-                
-            st.dataframe(filtered_df, use_container_width=True, height=500)
+    with tab_explorer:
+        # --- FILTERING SECTION ---
+        st.header("Advanced Lead Filter & CRM")
+        
+        with st.expander("⚙️ Filter Controls", expanded=True):
+            search_query = st.text_input("🔍 Global Keyword Search (Name, Address, etc.)", placeholder="e.g. 'Clinic' or 'New York'")
             
-        with tab_ai_pitch:
-            st.header("AI Pitch Generator")
-            st.markdown("Powered by **AWS Bedrock (Claude Opus 4)**")
+            col_f1, col_f2, col_f3 = st.columns(3)
             
-            col_a, col_b = st.columns([1, 2])
+            # Checkbox Filters
+            with col_f1:
+                st.markdown("**Essential Data Filters**")
+                must_have_email = st.checkbox("✉️ Must have Email Address")
+                must_have_phone = st.checkbox("☎️ Must have Phone Number")
+                must_have_website = st.checkbox("🌐 Must have Website")
             
-            with col_a:
-                st.subheader("1. Configure Context")
-                offering_context = st.text_area(
-                    "Our Offering (What are we selling?)", 
-                    value="We are a digital marketing agency specializing in local SEO and high-conversion web design. We help small businesses dominate local search and capture more foot traffic.",
-                    height=150
-                )
+            # Category & Status Filter
+            with col_f2:
+                st.markdown("**Category & Status Filters**")
+                categories = sorted(df['category'].dropna().unique().tolist())
+                selected_categories = st.multiselect("Filter by Category:", categories)
                 
-                st.subheader("2. Select Lead")
-                # Create a readable identifier for the dropdown
-                if 'Name' in df.columns:
-                    lead_options = df['Name'].dropna().tolist()
-                else:
-                    lead_options = [f"Lead #{i}" for i in range(len(df))]
-                    
-                selected_lead_name = st.selectbox("Choose a target lead", lead_options)
+                statuses = sorted(df['status'].dropna().unique().tolist())
+                selected_statuses = st.multiselect("Filter by CRM Status:", statuses, default=statuses)
+            
+            # Rating Filter
+            with col_f3:
+                st.markdown("**Rating Filter**")
+                min_rating = st.slider("Minimum Rating", min_value=0.0, max_value=5.0, value=0.0, step=0.1)
+
+        # --- APPLY FILTERS ---
+        filtered_df = df.copy()
+        
+        # Global Search
+        if search_query:
+            mask = filtered_df.astype(str).apply(lambda x: x.str.contains(search_query, case=False)).any(axis=1)
+            filtered_df = filtered_df[mask]
+            
+        # Boolean filters
+        if must_have_email:
+            filtered_df = filtered_df[filtered_df['email'].notna() & (filtered_df['email'].astype(str).str.strip() != "")]
+            
+        if must_have_phone:
+            filtered_df = filtered_df[filtered_df['phone'].notna() & (filtered_df['phone'].astype(str).str.strip() != "")]
+            
+        if must_have_website:
+            filtered_df = filtered_df[filtered_df['website'].notna() & (filtered_df['website'].astype(str).str.strip() != "")]
+            
+        # Category filter
+        if selected_categories:
+            filtered_df = filtered_df[filtered_df['category'].isin(selected_categories)]
+            
+        # Status filter
+        if selected_statuses:
+            filtered_df = filtered_df[filtered_df['status'].isin(selected_statuses)]
+            
+        # Rating filter
+        if min_rating > 0.0:
+            filtered_df['numeric_rating'] = pd.to_numeric(filtered_df['rating'], errors='coerce').fillna(0)
+            filtered_df = filtered_df[filtered_df['numeric_rating'] >= min_rating]
+            filtered_df = filtered_df.drop(columns=['numeric_rating'])
+
+        # --- DISPLAY EDITABLE CRM TABLE ---
+        st.markdown("### 📊 Interactive Lead Table")
+        st.caption(f"Showing **{len(filtered_df)}** out of {len(df)} leads. (Editable 'status' column)")
+        
+        # Configure columns for data editor
+        column_config = {
+            "id": None, # Hide ID
+            "status": st.column_config.SelectboxColumn(
+                "Status",
+                help="CRM Status of the lead",
+                width="medium",
+                options=[
+                    "New",
+                    "Contacted - Email",
+                    "Contacted - Phone",
+                    "Interested",
+                    "Meeting Booked",
+                    "Rejected"
+                ],
+            ),
+            "website": st.column_config.LinkColumn("Website")
+        }
+        
+        # Editable dataframe
+        edited_df = st.data_editor(
+            filtered_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config=column_config,
+            disabled=[col for col in filtered_df.columns if col != 'status'],
+            key="lead_crm_editor"
+        )
+        
+        # Detect changes and save to SQLite
+        if "lead_crm_editor" in st.session_state and "edited_rows" in st.session_state.lead_crm_editor:
+            changes = st.session_state.lead_crm_editor["edited_rows"]
+            if changes:
+                for row_idx, edit_data in changes.items():
+                    if 'status' in edit_data:
+                        # Get the actual ID of the lead that was edited
+                        actual_lead_id = filtered_df.iloc[int(row_idx)]['id']
+                        new_status = edit_data['status']
+                        update_status_in_db(int(actual_lead_id), new_status)
+                st.success("Changes saved to database!", icon="✅")
+        
+        # Export Filtered Data
+        st.markdown("---")
+        if len(filtered_df) > 0:
+            excel_data = convert_df_to_excel(filtered_df)
+            st.download_button(
+                label="📤 Export Filtered Leads to Excel",
+                data=excel_data,
+                file_name=f"filtered_leads_{selected_query.replace(' ', '_')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
+            )
+
+    with tab_map:
+        st.header("Geospatial Map")
+        st.markdown("Visual distribution of your scraped leads.")
+        
+        # Streamlit st.map requires columns named exactly "latitude" and "longitude" or "lat" and "lon"
+        map_df = filtered_df.copy()
+        
+        if 'lat' in map_df.columns and 'lng' in map_df.columns:
+            # Rename for st.map compatibility
+            map_df = map_df.rename(columns={'lat': 'latitude', 'lng': 'longitude'})
+            
+            # Drop rows without coordinates
+            map_df = map_df.dropna(subset=['latitude', 'longitude'])
+            
+            if len(map_df) > 0:
+                st.map(map_df, use_container_width=True, height=600)
+                st.caption(f"Showing {len(map_df)} plotted leads based on current filters.")
+            else:
+                st.info("None of the filtered leads have GPS coordinates available.")
+        else:
+            st.info("Latitude and Longitude columns are missing from the database.")
+
+    with tab_analytics:
+        st.header("Analytics")
+        col_a1, col_a2 = st.columns(2)
+        
+        with col_a1:
+            st.subheader("Leads by Category")
+            if 'category' in filtered_df.columns:
+                cat_counts = filtered_df['category'].value_counts().reset_index()
+                cat_counts.columns = ['Category', 'Count']
+                st.bar_chart(cat_counts.set_index('Category'))
                 
-            with col_b:
-                st.subheader("3. Generate Pitch")
-                if st.button("🚀 Generate Pitch with Claude Opus 4", type="primary", use_container_width=True):
-                    with st.spinner("Claude Opus 4 is crafting the perfect pitch..."):
-                        # Get the specific lead data
-                        if 'Name' in df.columns:
-                            lead_row = df[df['Name'] == selected_lead_name].iloc[0].to_dict()
-                        else:
-                            idx = int(selected_lead_name.replace("Lead #", ""))
-                            lead_row = df.iloc[idx].to_dict()
-                            
-                        # Clean up NaN values for JSON serialization
-                        lead_row = {k: v for k, v in lead_row.items() if pd.notna(v)}
-                        
-                        pitch_result = generate_pitch_with_opus(lead_row, offering_context, aws_region)
-                        
-                        st.success("Pitch Generated Successfully!")
-                        st.markdown("### Generated Outreach Email")
-                        st.info(pitch_result)
+        with col_a2:
+            st.subheader("CRM Pipeline Status")
+            if 'status' in filtered_df.columns:
+                stat_counts = filtered_df['status'].value_counts().reset_index()
+                stat_counts.columns = ['Status', 'Count']
+                st.bar_chart(stat_counts.set_index('Status'))
 
 if __name__ == "__main__":
     main()

@@ -209,6 +209,18 @@ async def process_place(semaphore, context, url, query):
     async with semaphore:
         data = await extract_from_place_page(context, url, query)
         if data and data["name"]:
+            # Filter out low-rated businesses (below 3.0). 
+            # We keep 0.0 as it usually means "No reviews yet" which can be a good lead.
+            rating_str = data.get("rating", "")
+            try:
+                rating_val = float(rating_str) if rating_str else 0.0
+            except ValueError:
+                rating_val = 0.0
+                
+            if 0.0 < rating_val < 3.0:
+                print(f"⊘ {data['name']} (Skipped: Low Rating {rating_val})")
+                return None
+
             if data["website"]:
                 # User wants unoptimized leads without websites, but we can save them all to DB and filter in dashboard
                 # For this rewrite, we will keep them all to have a comprehensive CRM

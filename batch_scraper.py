@@ -301,8 +301,37 @@ async def run_scraper(queries, max_results, headless, concurrency):
         try:
             browser = await p.chromium.launch(headless=headless)
         except Exception as e:
-            print(f"  ⚠ Playwright chromium failed to launch, trying system chromium: {e}")
-            browser = await p.chromium.launch(executable_path='/usr/bin/chromium-browser', headless=headless)
+            print(f"\n  ⚠ Playwright's default chromium failed to launch. Error: {e}")
+            print(f"  Attempting system fallbacks...\n")
+            
+            system_paths = [
+                '/usr/bin/chromium-browser',
+                '/usr/bin/chromium',
+                '/snap/bin/chromium',
+                '/usr/bin/google-chrome',
+                '/usr/bin/google-chrome-stable'
+            ]
+            
+            browser = None
+            for path in system_paths:
+                if os.path.exists(path):
+                    try:
+                        print(f"  ➜ Trying executable at {path}...")
+                        browser = await p.chromium.launch(executable_path=path, headless=headless)
+                        print(f"  ✓ Successfully launched {path}")
+                        break
+                    except Exception as ex:
+                        print(f"  ✗ Failed to launch {path}: {ex}")
+            
+            if not browser:
+                print("\n❌ FATAL: Could not launch any Chromium browser.")
+                print("   It looks like you are on a Linux/EC2 server and missing system dependencies.")
+                print("   Please run these exact commands in your terminal to fix it:")
+                print("   ------------------------------------------------------------")
+                print("   playwright install chromium")
+                print("   playwright install-deps")
+                print("   ------------------------------------------------------------")
+                sys.exit(1)
 
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},

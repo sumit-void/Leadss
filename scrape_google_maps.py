@@ -302,7 +302,11 @@ def main():
     print(f"   URL: {search_url}\n")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=100)
+        try:
+            browser = p.chromium.launch(headless=False, slow_mo=100)
+        except Exception as e:
+            print(f"  ⚠ Playwright chromium failed to launch, trying system chromium: {e}")
+            browser = p.chromium.launch(executable_path='/usr/bin/chromium-browser', headless=False, slow_mo=100)
         ctx = browser.new_context(
             viewport={"width": 1280, "height": 900},
             locale="en-US",

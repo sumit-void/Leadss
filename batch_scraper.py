@@ -1,56 +1,39 @@
 """
-Batch Google Maps Scraper — Async V2
+LeadMiner — Batch Google Maps Scraper
   - Reads queries from queries.txt
-  - Uses async Playwright to run much faster
-  - Extracts Lat/Lng from Google Maps URLs
-  - Saves directly to SQLite database (leadminer.db) with automatic deduplication
-  - No longer generates massive .xlsx files (Export is done via Dashboard)
+  - Uses async Playwright for speed
+  - HARD FILTERS: skip website, require phone, require 2+ rating
+  - Each run = unique batch_id (never overwrites old data)
+  - Saves directly to SQLite (leadminer.db)
 """
 
-import asyncio
-import re
-import os
-import sys
-import time
-import argparse
+import asyncio, re, os, sys, time, argparse
 from urllib.parse import quote_plus
-
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-from database import insert_lead
+from database import insert_lead, generate_batch_id
 
-# ═══════════════════════════════════════════════════════════════
-#  SCRAPER CORE (ASYNC)
-# ═══════════════════════════════════════════════════════════════
 
-async def scroll_results(page, max_results: int = 60):
+async def scroll_results(page, max_results=60):
     feed = await page.query_selector('div[role="feed"]')
     if not feed:
         return 0
-
-    last_count = 0
-    stale = 0
-
+    last_count, stale = 0, 0
     while stale < 10:
         items = await page.query_selector_all('div[role="feed"] > div > div > a')
         count = len(items)
-
         if count >= max_results:
             break
-
         if count == last_count:
             stale += 1
         else:
             stale = 0
             last_count = count
-
         await feed.evaluate("el => el.scrollTop = el.scrollHeight")
         await asyncio.sleep(1.8)
-
-    items = await page.query_selector_all('div[role="feed"] > div > div > a')
-    return min(len(items), max_results)
+    return min(len(await page.query_selector_all('div[role="feed"] > div > div > a')), max_results)
 
 
-async def collect_place_urls(page, max_results: int = 60) -> list[str]:
+async def collect_place_urls(page, max_results=60):
     links = await page.query_selector_all('div[role="feed"] > div > div > a')
     urls = []
     for link in links[:max_results]:
@@ -59,29 +42,24 @@ async def collect_place_urls(page, max_results: int = 60) -> list[str]:
             urls.append(href)
     return urls
 
-def extract_lat_lng(url: str):
-    """Extract lat/lng from a Google Maps URL, e.g., @40.7128,-74.0060,15z"""
-    match = re.search(r'@(-?\d+\.\d+),(-?\d+\.\d+)', url)
-    if match:
-        return float(match.group(1)), float(match.group(2))
-    return None, None
+
+def extract_lat_lng(url):
+    m = re.search(r'@(-?\d+\.\d+),(-?\d+\.\d+)', url)
+    return (float(m.group(1)), float(m.group(2))) if m else (None, None)
 
 
-async def extract_from_place_page(context, url: str, query: str) -> dict | None:
+async def extract_from_place_page(context, url, query):
     page = await context.new_page()
     try:
         await page.goto(url, wait_until="load", timeout=30000)
         await asyncio.sleep(2)
-
         try:
             await page.wait_for_selector('h1.DUwDvf, h1.fontHeadlineLarge, h1', timeout=8000)
         except PWTimeout:
             await page.close()
             return None
 
-        # Scroll detail panel
-        detail_panels = await page.query_selector_all('div[role="main"]')
-        for panel in detail_panels:
+        for panel in await page.query_selector_all('div[role="main"]'):
             try:
                 for _ in range(3):
                     await panel.evaluate("el => el.scrollTop += 500")
@@ -91,20 +69,8 @@ async def extract_from_place_page(context, url: str, query: str) -> dict | None:
                 pass
 
         lat, lng = extract_lat_lng(page.url)
-
-        data = {
-            "name": "",
-            "address": "",
-            "phone": "",
-            "email": "",
-            "website": "",
-            "rating": "",
-            "total_reviews": "",
-            "category": "",
-            "query": query,
-            "lat": lat,
-            "lng": lng
-        }
+        data = {"name":"","address":"","phone":"","email":"","website":"",
+                "rating":"","total_reviews":"","category":"","query":query,"lat":lat,"lng":lng}
 
         # Name
         for sel in ['h1.DUwDvf', 'h1.fontHeadlineLarge', 'h1']:
@@ -114,7 +80,6 @@ async def extract_from_place_page(context, url: str, query: str) -> dict | None:
                 if txt and txt.lower() != "results":
                     data["name"] = txt
                     break
-
         if not data["name"]:
             await page.close()
             return None
@@ -129,7 +94,7 @@ async def extract_from_place_page(context, url: str, query: str) -> dict | None:
         if not el:
             el = await page.query_selector('div.F7nice span:nth-child(2)')
         if el:
-            data["total_reviews"] = (await el.inner_text()).strip().replace("(", "").replace(")", "").replace(",", "")
+            data["total_reviews"] = (await el.inner_text()).strip().replace("(","").replace(")","").replace(",","")
 
         # Category
         el = await page.query_selector('button[jsaction*="category"]')
@@ -150,24 +115,20 @@ async def extract_from_place_page(context, url: str, query: str) -> dict | None:
                 data["phone"] = (await el.inner_text()).strip()
                 break
 
-        # Email Extraction (Simplified async version)
-        email_selectors = [
-            'a[data-item-id*="email"]', 'button[data-item-id*="email"]', 'a[href^="mailto:"]',
-            'a[data-tooltip="Send email"]', 'button[data-tooltip="Send email"]',
-            'a[aria-label*="email"]', 'button[aria-label*="email"]'
-        ]
-        for sel in email_selectors:
+        # Email
+        for sel in ['a[data-item-id*="email"]','button[data-item-id*="email"]','a[href^="mailto:"]',
+                     'a[data-tooltip="Send email"]','button[data-tooltip="Send email"]']:
             el = await page.query_selector(sel)
             if el:
                 href = await el.get_attribute("href") or ""
                 if href.startswith("mailto:"):
-                    data["email"] = href.replace("mailto:", "").split("?")[0].strip()
+                    data["email"] = href.replace("mailto:","").split("?")[0].strip()
                 else:
                     aria = await el.get_attribute("aria-label") or ""
                     txt = (await el.inner_text()).strip()
-                    email_in_aria = re.search(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', aria)
-                    if email_in_aria:
-                        data["email"] = email_in_aria.group()
+                    m = re.search(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', aria)
+                    if m:
+                        data["email"] = m.group()
                     elif "@" in txt:
                         data["email"] = txt
                 if data["email"]:
@@ -176,9 +137,8 @@ async def extract_from_place_page(context, url: str, query: str) -> dict | None:
         if not data["email"]:
             try:
                 page_text = await page.inner_text('body')
-                matches = re.findall(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', page_text)
-                for email in matches:
-                    if "google.com" not in email.lower() and "gstatic" not in email.lower() and "example" not in email.lower():
+                for email in re.findall(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', page_text):
+                    if "google.com" not in email.lower() and "gstatic" not in email.lower():
                         data["email"] = email
                         break
             except Exception:
@@ -195,192 +155,164 @@ async def extract_from_place_page(context, url: str, query: str) -> dict | None:
 
         await page.close()
         return data
-
-    except Exception as e:
+    except Exception:
         await page.close()
         return None
 
-# ═══════════════════════════════════════════════════════════════
-#  ASYNC BATCH RUNNER
-# ═══════════════════════════════════════════════════════════════
 
-async def process_place(semaphore, context, url, query):
-    """Process a single place concurrently"""
-    async with semaphore:
-        data = await extract_from_place_page(context, url, query)
-        if data and data["name"]:
-            # Filter out low-rated businesses (below 3.0). 
-            # We keep 0.0 as it usually means "No reviews yet" which can be a good lead.
-            rating_str = data.get("rating", "")
-            try:
-                rating_val = float(rating_str) if rating_str else 0.0
-            except ValueError:
-                rating_val = 0.0
-                
-            if 0.0 < rating_val < 3.0:
-                print(f"⊘ {data['name']} (Skipped: Low Rating {rating_val})")
-                return None
+async def process_place(sem, ctx, url, query, batch_id, stats):
+    async with sem:
+        data = await extract_from_place_page(ctx, url, query)
+        if not data or not data["name"]:
+            stats["failed"] += 1
+            return None
 
-            if data["website"]:
-                # User wants unoptimized leads without websites, but we can save them all to DB and filter in dashboard
-                # For this rewrite, we will keep them all to have a comprehensive CRM
-                pass
-            
-            # Insert into database in real-time
-            inserted = insert_lead(data)
-            
-            email_str = f" | ✉ {data['email']}" if data['email'] else ""
-            db_str = "(New)" if inserted else "(Duplicate)"
-            print(f"✓ {data['name']} {db_str} | ☎ {data['phone'] or '—'}{email_str}")
-            return data
-        return None
+        # FILTER 1: Skip if has website
+        if data.get("website","").strip():
+            print(f"  ⊘ {data['name']} — Has website, skipped")
+            stats["skipped_website"] += 1
+            return None
+
+        # FILTER 2: Skip if no phone
+        if not data.get("phone","").strip():
+            print(f"  ⊘ {data['name']} — No phone, skipped")
+            stats["skipped_no_phone"] += 1
+            return None
+
+        # FILTER 3: Skip if rating < 2.0 (keep unrated)
+        try:
+            rv = float(data.get("rating","") or "0")
+        except ValueError:
+            rv = 0.0
+        if 0 < rv < 2.0:
+            print(f"  ⊘ {data['name']} — Low rating ({rv}), skipped")
+            stats["skipped_low_rating"] += 1
+            return None
+
+        inserted = insert_lead(data, batch_id=batch_id)
+        em = f" | ✉ {data['email']}" if data['email'] else ""
+        rt = f" | ⭐ {rv}" if rv > 0 else ""
+        db = "(New)" if inserted else "(Dup)"
+        print(f"  ✓ {data['name']} {db} | ☎ {data['phone']}{em}{rt}")
+        stats["saved"] += 1
+        return data
 
 
-async def scrape_query(context, query: str, max_results: int = 100, concurrency: int = 5):
-    """Search for a query, scroll, collect URLs, and process them concurrently."""
-    search_url = f"https://www.google.com/maps/search/{quote_plus(query)}"
-
-    print(f"\n  ⏳ Loading: {search_url}")
-    page = await context.new_page()
+async def scrape_query(ctx, query, batch_id, max_results=100, concurrency=5):
+    url = f"https://www.google.com/maps/search/{quote_plus(query)}"
+    print(f"\n  ⏳ Loading: {url}")
+    page = await ctx.new_page()
     try:
-        await page.goto(search_url, wait_until="load", timeout=60000)
+        await page.goto(url, wait_until="load", timeout=60000)
     except Exception as e:
-        print(f"  ❌ Failed to load search: {e}")
+        print(f"  ❌ Failed: {e}")
         await page.close()
-        return
-
+        return {}
     await asyncio.sleep(4)
 
-    # Handle consent
     for sel in ['button:has-text("Accept all")', 'button:has-text("Accept")']:
         try:
             btn = await page.query_selector(sel)
             if btn and await btn.is_visible():
                 await btn.click()
-                print("  ✓ Accepted consent")
                 await asyncio.sleep(3)
-                await page.goto(search_url, wait_until="load", timeout=60000)
+                await page.goto(url, wait_until="load", timeout=60000)
                 await asyncio.sleep(5)
                 break
         except Exception:
             pass
 
-    # Wait for feed
     try:
         await page.wait_for_selector('div[role="feed"]', timeout=30000)
     except PWTimeout:
-        print("  ⚠ No results feed found — skipping this query")
+        print("  ⚠ No results feed — skipping")
         await page.close()
-        return
+        return {}
 
-    await scroll_results(page, max_results=max_results)
-    place_urls = await collect_place_urls(page, max_results=max_results)
-    total = len(place_urls)
-    print(f"  📋 Found {total} places for '{query}'. Extracting details concurrently...")
-    
+    await scroll_results(page, max_results)
+    place_urls = await collect_place_urls(page, max_results)
+    print(f"  📋 Found {len(place_urls)} places for '{query}'")
     await page.close()
 
-    if total == 0:
-        return
+    if not place_urls:
+        return {}
 
-    # Process URLs concurrently with a semaphore
-    semaphore = asyncio.Semaphore(concurrency)
-    tasks = [process_place(semaphore, context, url, query) for url in place_urls]
-    
-    await asyncio.gather(*tasks)
+    stats = {"saved":0,"skipped_website":0,"skipped_no_phone":0,"skipped_low_rating":0,"failed":0}
+    sem = asyncio.Semaphore(concurrency)
+    await asyncio.gather(*[process_place(sem, ctx, u, query, batch_id, stats) for u in place_urls])
+    return stats
 
 
 async def run_scraper(queries, max_results, headless, concurrency):
-    print("\n╔════════════════════════════════════════════════════════╗")
-    print("║   LeadMiner Async Scraper (SQLite Backend)             ║")
-    print("╚════════════════════════════════════════════════════════╝")
-    
-    start_time = time.time()
-    
+    batch_id = generate_batch_id()
+    print("\n╔════════════════════════════════════════════════════╗")
+    print("║   LeadMiner Scraper                                ║")
+    print("╚════════════════════════════════════════════════════╝")
+    print(f"  Batch  : {batch_id}")
+    print(f"  Queries: {len(queries)}")
+    print(f"  Filters: No website ✓ | Has phone ✓ | Rating ≥ 2.0 ✓")
+
+    start = time.time()
+    totals = {"saved":0,"skipped_website":0,"skipped_no_phone":0,"skipped_low_rating":0,"failed":0}
+
     async with async_playwright() as p:
         try:
             browser = await p.chromium.launch(headless=headless)
-        except Exception as e:
-            print(f"\n  ⚠ Playwright's default chromium failed to launch. Error: {e}")
-            print(f"  Attempting system fallbacks...\n")
-            
-            system_paths = [
-                '/usr/bin/chromium-browser',
-                '/usr/bin/chromium',
-                '/snap/bin/chromium',
-                '/usr/bin/google-chrome',
-                '/usr/bin/google-chrome-stable'
-            ]
-            
+        except Exception:
             browser = None
-            for path in system_paths:
+            for path in ['/usr/bin/chromium-browser','/usr/bin/chromium','/snap/bin/chromium',
+                         '/usr/bin/google-chrome','/usr/bin/google-chrome-stable']:
                 if os.path.exists(path):
                     try:
-                        print(f"  ➜ Trying executable at {path}...")
                         browser = await p.chromium.launch(executable_path=path, headless=headless)
-                        print(f"  ✓ Successfully launched {path}")
                         break
-                    except Exception as ex:
-                        print(f"  ✗ Failed to launch {path}: {ex}")
-            
+                    except Exception:
+                        pass
             if not browser:
-                print("\n❌ FATAL: Could not launch any Chromium browser.")
-                print("   It looks like you are on a Linux/EC2 server and missing system dependencies.")
-                print("   Please run these exact commands in your terminal to fix it:")
-                print("   ------------------------------------------------------------")
-                print("   playwright install chromium")
-                print("   playwright install-deps")
-                print("   ------------------------------------------------------------")
+                print("❌ No browser found. Run: playwright install chromium")
                 sys.exit(1)
 
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            locale="en-US",
-        )
+        ctx = await browser.new_context(viewport={"width":1280,"height":900}, locale="en-US")
 
-        for i, query in enumerate(queries, 1):
-            print(f"\n{'━' * 58}")
-            print(f"  🔍 [{i}/{len(queries)}] \"{query}\"")
-            print(f"{'━' * 58}")
-            
-            await scrape_query(context, query, max_results, concurrency)
+        for i, q in enumerate(queries, 1):
+            print(f"\n{'━'*55}")
+            print(f"  🔍 [{i}/{len(queries)}] \"{q}\"")
+            print(f"{'━'*55}")
+            s = await scrape_query(ctx, q, batch_id, max_results, concurrency)
+            for k in totals:
+                totals[k] += s.get(k, 0)
 
         await browser.close()
 
-    elapsed = time.time() - start_time
-    elapsed_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
-    
-    print(f"\n{'═' * 58}")
-    print(f"  📊 BATCH COMPLETE")
-    print(f"  Time elapsed  : {elapsed_str}")
-    print(f"  Results saved directly to leadminer.db")
-    print(f"{'═' * 58}\n")
+    elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - start))
+    print(f"\n{'═'*55}")
+    print(f"  📊 DONE — {batch_id}")
+    print(f"  Time: {elapsed} | Saved: {totals['saved']}")
+    print(f"  Skipped → Website: {totals['skipped_website']} | No phone: {totals['skipped_no_phone']} | Low rating: {totals['skipped_low_rating']}")
+    print(f"{'═'*55}\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Async Batch Google Maps Scraper")
-    parser.add_argument("--file", default="queries.txt", help="Path to queries file")
-    parser.add_argument("--max", type=int, default=100, help="Max results per query (default: 100)")
-    parser.add_argument("--concurrency", type=int, default=5, help="Concurrent pages to process (default: 5)")
-    parser.add_argument("--headed", action="store_false", dest="headless", help="Run browser with GUI (headed mode)")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="LeadMiner Scraper")
+    ap.add_argument("--file", default="queries.txt")
+    ap.add_argument("--max", type=int, default=100)
+    ap.add_argument("--concurrency", type=int, default=5)
+    ap.add_argument("--headed", action="store_false", dest="headless")
+    args = ap.parse_args()
 
-    queries_file = args.file
-    if not os.path.exists(queries_file):
-        print(f"❌ Queries file not found: {queries_file}")
+    if not os.path.exists(args.file):
+        print(f"❌ File not found: {args.file}")
         sys.exit(1)
 
-    with open(queries_file, "r", encoding="utf-8") as f:
-        queries = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    with open(args.file, "r", encoding="utf-8") as f:
+        queries = [l.strip() for l in f if l.strip() and not l.startswith("#")]
 
     if not queries:
-        print("❌ No queries found in the file.")
+        print("❌ No queries found.")
         sys.exit(1)
 
-    # Run the async loop
     asyncio.run(run_scraper(queries, args.max, args.headless, args.concurrency))
 
 
 if __name__ == "__main__":
     main()
-

@@ -5,3 +5,5 @@ output/
 .env
 debug_*.png
 .DS_Store
+queriess.txt
+    

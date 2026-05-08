@@ -1,9 +1,41 @@
-venv/
+# Python
 __pycache__/
-output/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Environment
 .env
-debug_*.png
+
+# Database
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+docker-compose.override.yml
+
+# Output
+output/
+*.xlsx
+*.csv
+
+# OS
 .DS_Store
-queriess.txt
-    
+Thumbs.db
+
+# Logs
+*.log

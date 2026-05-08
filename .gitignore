@@ -1,32 +1,16 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.egg-info/
-dist/
-build/
-*.egg
-
-# Virtual Environment
 venv/
 .venv/
-env/
-
-# Environment
-.env
 
 # Database
 *.db
-*.sqlite3
 
 # IDE
 .vscode/
 .idea/
-*.swp
-*.swo
-
-# Docker
-docker-compose.override.yml
 
 # Output
 output/

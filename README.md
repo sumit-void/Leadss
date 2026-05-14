@@ -29,15 +29,23 @@ dental clinic in Dubai
 beauty salon in Abu Dhabi
 ```
 
-### 2. Run the scraper
+### 2. Run the scraper (Step 1)
 
 ```bash
-python run.py
+python scraper.py
 ```
 
-This does **everything automatically**:
-- Searches Google for each query
-- Finds business websites
+This searches Google for each query and finds the business website URLs.
+Because Google sometimes shows CAPTCHAs, this is kept separate. 
+If it stops, the progress is automatically saved to `scraped_businesses.json`.
+
+### 3. Extract Emails and Audit (Step 2)
+
+```bash
+python process_urls.py
+```
+
+This reads the URLs from Step 1 and processes them **concurrently** (at the same time!):
 - Crawls each website (homepage + contact/about pages)
 - Extracts emails (4 methods: mailto, schema, HTML, regex)
 - Scores each website (higher score = needs more help = better lead)
@@ -60,11 +68,17 @@ Opens a dashboard where you can:
 
 ## Options
 
+### Scraper Options:
 ```bash
-python run.py --pages 3        # Search 3 Google pages per query (default: 2)
-python run.py --max 50         # Max 50 businesses per query (default: 30)
-python run.py --headed         # Show browser (useful for debugging)
-python run.py --file my.txt    # Use different queries file
+python scraper.py --pages 3        # Search 3 Google pages per query (default: 2)
+python scraper.py --headed         # Show browser (useful for debugging CAPTCHAs)
+python scraper.py --file my.txt    # Use different queries file
+```
+
+### Processor Options:
+```bash
+python process_urls.py --concurrency 15  # Process 15 websites at a time (default: 10)
+python process_urls.py --file data.json  # Read from a specific json file
 ```
 
 ---
@@ -94,9 +108,9 @@ For each business:
 
 | File | What it does |
 |------|-------------|
-| `run.py` | **Main script** — runs the full pipeline |
+| `scraper.py` | **Step 1:** Google Search scraper (Playwright). Outputs to `scraped_businesses.json` |
+| `process_urls.py` | **Step 2:** Concurrent website crawler and email extractor. Saves to DB. |
 | `app.py` | Streamlit dashboard |
-| `scraper.py` | Google Search scraper (Playwright) |
 | `crawler.py` | Website crawler (async httpx) |
 | `email_extractor.py` | Email extraction (4 methods) |
 | `auditor.py` | Website quality scoring |

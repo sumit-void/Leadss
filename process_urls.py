@@ -1,15 +1,11 @@
 """
-LeadGen — Main Runner
-One command to scrape + crawl + extract emails + audit + save to DB:
-  python run.py
+LeadGen — Process URLs (standalone)
+Reads scraped_businesses.json (written by scraper.py) and
+crawls / extracts emails / audits each site concurrently.
 
-Workflow:
-  1. Search DuckDuckGo / Bing for each query → collect business URLs
-  2. Crawl each website concurrently
-  3. Extract emails from HTML
-  4. Score/audit the site
-  5. Store everything in SQLite (leadgen.db)
-  6. View results: streamlit run app.py
+Usage:
+  python scraper.py          # step 1 — collect URLs
+  python process_urls.py     # step 2 — crawl & store results
 """
 
 import asyncio
@@ -26,7 +22,6 @@ from database import (
     generate_batch_id, insert_business, update_business,
     insert_website, insert_email, insert_audit, get_stats,
 )
-from scraper import search_google, parse_niche_location, main_scraper
 from crawler import crawl_website
 from email_extractor import extract_emails
 from auditor import audit_website
@@ -39,7 +34,6 @@ async def process_one(url_data: dict, batch_id: str, stats: dict):
     biz_id = insert_business(url_data, batch_id)
 
     if biz_id is None:
-        # Already in DB from a previous run
         stats["dupes"] += 1
         return
 
@@ -56,7 +50,7 @@ async def process_one(url_data: dict, batch_id: str, stats: dict):
 
     homepage = pages[0] if pages else None
     if not homepage or homepage.get("error"):
-        err = homepage.get("error", "unknown error") if homepage else "no data"
+        err = homepage.get("error", "unknown") if homepage else "no data"
         print(f"    ⚠️  Unreachable: {url}  [{err}]")
         return
 
@@ -74,12 +68,12 @@ async def process_one(url_data: dict, batch_id: str, stats: dict):
     for page in pages:
         if page.get("html"):
             emails = extract_emails(
-                page["html"], page.get("url", url),
+                page["html"],
+                page.get("url", url),
                 page.get("page_type", "homepage"),
             )
             all_emails.extend(emails)
 
-    # Deduplicate
     seen: set = set()
     for em in all_emails:
         addr = em["email"]
@@ -139,58 +133,33 @@ async def _worker(queue: asyncio.Queue, batch_id: str, stats: dict):
             queue.task_done()
 
 
-# ── Full pipeline ─────────────────────────────────────────────────────────────
+# ── Pipeline ──────────────────────────────────────────────────────────────────
 
-async def run_pipeline(queries: list, max_pages: int, headless: bool,
-                       max_per_query: int, concurrency: int):
+async def run_pipeline(businesses: list, concurrency: int):
     batch_id = generate_batch_id()
 
     print("\n================================================")
-    print("        LeadGen — Full Pipeline               ")
+    print("        LeadGen — Concurrent Crawler          ")
     print("================================================")
     print(f"  Batch      : {batch_id}")
-    print(f"  Queries    : {len(queries)}")
-    print(f"  Pages/query: {max_pages}")
+    print(f"  Businesses : {len(businesses)}")
     print(f"  Concurrency: {concurrency}")
     print()
 
     start = time.time()
     total_stats = {"new": 0, "dupes": 0, "emails": 0}
 
-    for i, query in enumerate(queries, 1):
-        print(f"\n{'-' * 50}")
-        print(f"  [{i}/{len(queries)}] \"{query}\"")
-        print(f"{'-' * 50}")
+    queue: asyncio.Queue = asyncio.Queue()
+    for b in businesses:
+        queue.put_nowait(b)
 
-        niche, location = parse_niche_location(query)
-
-        # ── Search ──────────────────────────────────────
-        results = await search_google(query, max_pages=max_pages, headless=headless)
-
-        if not results:
-            print("  ⚠️  No results found for this query.")
-            continue
-
-        results = results[:max_per_query]
-        for r in results:
-            r.setdefault("niche", niche)
-            r.setdefault("location", location)
-            r.setdefault("query", query)
-
-        print(f"  📦 Processing {len(results)} businesses (concurrency={concurrency})…")
-
-        # ── Concurrent crawl + process ───────────────────
-        queue: asyncio.Queue = asyncio.Queue()
-        for r in results:
-            queue.put_nowait(r)
-
-        workers = [
-            asyncio.create_task(_worker(queue, batch_id, total_stats))
-            for _ in range(min(concurrency, len(results)))
-        ]
-        await queue.join()
-        for w in workers:
-            w.cancel()
+    workers = [
+        asyncio.create_task(_worker(queue, batch_id, total_stats))
+        for _ in range(min(concurrency, len(businesses)))
+    ]
+    await queue.join()
+    for w in workers:
+        w.cancel()
 
     elapsed = time.strftime("%H:%M:%S", time.gmtime(time.time() - start))
     db_stats = get_stats()
@@ -209,33 +178,44 @@ async def run_pipeline(queries: list, max_pages: int, headless: bool,
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description="LeadGen — Full Pipeline Runner")
-    ap.add_argument("--file", default="queriess.txt",
-                    help="Queries file (default: queriess.txt)")
-    ap.add_argument("--pages", type=int, default=3,
-                    help="Result pages per query (default: 3)")
-    ap.add_argument("--max", type=int, default=30,
-                    help="Max businesses per query (default: 30)")
-    ap.add_argument("--concurrency", type=int, default=5,
-                    help="Concurrent crawlers (default: 5)")
-    ap.add_argument("--headed", action="store_true",
-                    help="(Ignored — no browser used)")
+    ap = argparse.ArgumentParser(description="LeadGen — Process URLs")
+    ap.add_argument(
+        "--file", default="scraped_businesses.json",
+        help="Input JSON file (default: scraped_businesses.json)",
+    )
+    ap.add_argument(
+        "--concurrency", type=int, default=5,
+        help="Number of concurrent crawlers (default: 5)",
+    )
     args = ap.parse_args()
 
-    queries_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), args.file)
-    if not os.path.exists(queries_file):
-        print(f"❌ Queries file not found: {queries_file}")
+    json_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), args.file)
+
+    if not os.path.exists(json_file):
+        print(f"❌ File not found: {json_file}")
+        print("   Run 'python scraper.py' first to collect business URLs.")
         sys.exit(1)
 
-    with open(queries_file, "r", encoding="utf-8") as f:
-        queries = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    with open(json_file, "r", encoding="utf-8") as f:
+        try:
+            businesses = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"❌ Invalid JSON in {json_file}: {e}")
+            sys.exit(1)
 
-    if not queries:
-        print("❌ No queries found in the file.")
+    if not isinstance(businesses, list) or len(businesses) == 0:
+        print(f"❌ No businesses found in {json_file}.")
+        print("   Run 'python scraper.py' first.")
         sys.exit(1)
 
-    print(f"  Loaded {len(queries)} queries from {args.file}")
-    asyncio.run(run_pipeline(queries, args.pages, not args.headed, args.max, args.concurrency))
+    # Filter out entries missing a URL
+    businesses = [b for b in businesses if b.get("url")]
+    if not businesses:
+        print("❌ All entries are missing a 'url' field — cannot process.")
+        sys.exit(1)
+
+    print(f"  Loaded {len(businesses)} businesses from {args.file}")
+    asyncio.run(run_pipeline(businesses, args.concurrency))
 
 
 if __name__ == "__main__":

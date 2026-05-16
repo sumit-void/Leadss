@@ -15,10 +15,18 @@ import json
 import argparse
 import sys
 import os
+import functools
 from urllib.parse import urlparse, urlencode, quote_plus
 
+# Force unbuffered stdout so progress is visible in real-time
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
+
+# Override print to always flush
+_builtin_print = print
+def print(*args, **kwargs):
+    kwargs.setdefault('flush', True)
+    _builtin_print(*args, **kwargs)
 
 import httpx
 from bs4 import BeautifulSoup
@@ -42,6 +50,9 @@ SEARXNG_INSTANCES = [
     "https://searx.tiekoetter.com",
     "https://searxng.world",
     "https://search.inetol.net",
+    "https://priv.au",
+    "https://search.sapti.me",
+    "https://searx.tuxcloud.net",
 ]
 
 # ── Domains to skip ───────────────────────────────────────────────────────────
@@ -118,7 +129,7 @@ async def _search_duckduckgo(query: str, max_results: int = 30) -> list:
     }
     results = []
 
-    async with httpx.AsyncClient(headers=headers, timeout=30.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(headers=headers, timeout=20.0, follow_redirects=True) as client:
         resp = None
         for attempt in range(3):
             try:
@@ -126,20 +137,26 @@ async def _search_duckduckgo(query: str, max_results: int = 30) -> list:
                     "https://html.duckduckgo.com/html/",
                     data={"q": query, "b": "", "kl": "us-en"},
                 )
+            except httpx.TimeoutException:
+                print(f"    ⚠️  DDG timeout (attempt {attempt+1})")
+                continue
             except Exception as e:
+                print(f"    ⚠️  DDG error: {type(e).__name__}: {e}")
                 return results
 
             if resp.status_code == 200:
                 break
             if resp.status_code == 202:
-                wait = 8 + attempt * 8
+                wait = 5 + attempt * 5
                 print(f"    ⏳ DDG rate-limit (202), waiting {wait}s…")
                 await asyncio.sleep(wait)
                 continue
             # Other error
+            print(f"    ⚠️  DDG HTTP {resp.status_code}")
             return results
 
         if resp is None or resp.status_code != 200:
+            print(f"    ⚠️  DDG failed after 3 attempts")
             return results
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -196,24 +213,37 @@ async def _search_bing(query: str, max_results: int = 30) -> list:
     results = []
     seen_domains: set = set()
 
-    async with httpx.AsyncClient(headers=headers, timeout=30.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(headers=headers, timeout=15.0, follow_redirects=True) as client:
         for page in range(3):
             params = {"q": query, "first": str(page * 10 + 1), "count": "10"}
             try:
                 resp = await client.get("https://www.bing.com/search", params=params)
+            except httpx.TimeoutException:
+                print(f"    ⚠️  Bing timeout (page {page+1})")
+                break
             except Exception as e:
+                print(f"    ⚠️  Bing error: {type(e).__name__}: {e}")
                 break
 
             if resp.status_code != 200:
+                print(f"    ⚠️  Bing HTTP {resp.status_code}")
                 break
 
             soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Detect CAPTCHA / blocked page
+            page_text = soup.get_text(separator=" ", strip=True).lower()
+            if "captcha" in page_text or "unusual traffic" in page_text or "verify" in page_text[:200]:
+                print(f"    ⚠️  Bing CAPTCHA/block detected on page {page+1}")
+                break
 
             # Bing organic results are in <li class="b_algo">
             items = soup.find_all("li", class_="b_algo")
             if not items:
                 # Try alternate selector
                 items = soup.find_all(class_=re.compile(r"\bb_algo\b"))
+            if not items:
+                print(f"    ⚠️  Bing page {page+1}: 0 results parsed (possible block)")
 
             for li in items:
                 a_tag = li.find("h2", recursive=True)
@@ -271,7 +301,7 @@ async def _search_searxng(query: str, max_results: int = 30) -> list:
 
     instances = random.sample(SEARXNG_INSTANCES, len(SEARXNG_INSTANCES))
 
-    async with httpx.AsyncClient(headers=headers, timeout=20.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(headers=headers, timeout=10.0, follow_redirects=True) as client:
         for instance in instances:
             try:
                 params = {
@@ -283,6 +313,7 @@ async def _search_searxng(query: str, max_results: int = 30) -> list:
                 resp = await client.get(f"{instance}/search", params=params)
 
                 if resp.status_code != 200:
+                    print(f"    ⚠️  SearXNG {instance} → HTTP {resp.status_code}")
                     continue
 
                 data = resp.json()
@@ -306,11 +337,73 @@ async def _search_searxng(query: str, max_results: int = 30) -> list:
                         break
 
                 if results:
-                    print(f"    ✓ SearXNG ({instance}) returned {len(results)} results")
+                    print(f"    ✓ SearXNG ({instance}) → {len(results)} results")
                     return results
+                else:
+                    print(f"    ⚠️  SearXNG {instance} → 0 results")
 
-            except Exception as e:
+            except httpx.TimeoutException:
+                print(f"    ⚠️  SearXNG {instance} → timeout")
                 continue
+            except Exception as e:
+                print(f"    ⚠️  SearXNG {instance} → {type(e).__name__}")
+                continue
+
+    return results
+
+
+# ── Source 4: Brave Search HTML ───────────────────────────────────────────────
+
+async def _search_brave(query: str, max_results: int = 30) -> list:
+    """Scrape Brave Search HTML results (no API key required)."""
+    ua = random.choice(USER_AGENTS)
+    headers = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    results = []
+
+    async with httpx.AsyncClient(headers=headers, timeout=15.0, follow_redirects=True) as client:
+        try:
+            params = {"q": query, "source": "web"}
+            resp = await client.get("https://search.brave.com/search", params=params)
+        except httpx.TimeoutException:
+            print(f"    ⚠️  Brave timeout")
+            return results
+        except Exception as e:
+            print(f"    ⚠️  Brave error: {type(e).__name__}: {e}")
+            return results
+
+        if resp.status_code != 200:
+            print(f"    ⚠️  Brave HTTP {resp.status_code}")
+            return results
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Brave organic results
+        for div in soup.find_all("div", class_=re.compile(r"snippet")):
+            a_tag = div.find("a", href=True)
+            if not a_tag:
+                continue
+            href = a_tag.get("href", "")
+            if not href.startswith("http") or not _is_valid_url(href):
+                continue
+
+            title_el = div.find(class_=re.compile(r"title|heading")) or a_tag
+            title = title_el.get_text(strip=True) if title_el else ""
+            snippet_el = div.find(class_=re.compile(r"description|snippet-description"))
+            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+
+            results.append({
+                "name": _extract_name(title, href),
+                "url": href,
+                "snippet": snippet[:500],
+                "title": title[:300],
+                "source": "brave",
+            })
+            if len(results) >= max_results:
+                break
 
     return results
 
@@ -319,7 +412,7 @@ async def _search_searxng(query: str, max_results: int = 30) -> list:
 
 async def search_google(query: str, max_pages: int = 3, headless: bool = True) -> list:
     """
-    Search for businesses using DuckDuckGo → Bing → SearXNG (in order).
+    Search for businesses using DuckDuckGo → Brave → SearXNG → Bing (in order).
     Returns list of {name, url, snippet, title, page_num}.
     `max_pages` and `headless` kept for backward compatibility.
     """
@@ -331,17 +424,25 @@ async def search_google(query: str, max_pages: int = 3, headless: bool = True) -
     if results:
         print(f"  ✅ DuckDuckGo: {len(results)} results")
     else:
-        # --- 2. Try Bing ---
+        # --- 2. Try Brave (most reliable fallback) ---
         await asyncio.sleep(random.uniform(1.0, 2.0))
-        results = await _search_bing(query, max_results=max_results)
+        results = await _search_brave(query, max_results=max_results)
         if results:
-            print(f"  ✅ Bing: {len(results)} results")
+            print(f"  ✅ Brave: {len(results)} results")
         else:
             # --- 3. Try SearXNG ---
             await asyncio.sleep(random.uniform(1.0, 2.0))
             results = await _search_searxng(query, max_results=max_results)
-            if not results:
-                print(f"  ⚠️  All search sources returned 0 results for: {query}")
+            if results:
+                print(f"  ✅ SearXNG: {len(results)} results")
+            else:
+                # --- 4. Try Bing (often JS-only, last resort) ---
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                results = await _search_bing(query, max_results=max_results)
+                if results:
+                    print(f"  ✅ Bing: {len(results)} results")
+                else:
+                    print(f"  ⚠️  All search sources returned 0 results for: {query}")
 
     unique = _dedupe(results)
     for r in unique:
